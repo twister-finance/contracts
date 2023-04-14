@@ -1311,12 +1311,14 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
      * @dev This calculates interest accrued from the last checkpointed block
      *   up to the current block and writes new checkpoint to storage.
      */
+
+    uint256 internal constant VLP_PRICE_DECIMALS = 5;
+    
     function accrueInterest() virtual override public returns (uint) {
         /* Determine the amount of VLP gain in price we will need to pull from contract to account for performance fee */
         if (isVLP){
-            uint256 VLP_PRICE_DECIMALS = 5;
             uint256 price = VLPVault(vlpVault).getVLPPrice() * 1e18 / (10**VLP_PRICE_DECIMALS);
-            if(lastVlpDepositAmount == 0){
+            if(lastVlpDepositAmount == 0 || performanceFee == 0){
                 // This is the initial accrual, do not pull anything out
                 lastVlpDepositAmount = price;
                 return NO_ERROR;
@@ -1328,6 +1330,7 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
             if(price > lastVlpDepositAmount){
                 // Price has increased, determine the percent increase, multiply it by performance fee and subtract that percentage and remove to admin
                 uint256 percentIncrease = div_(mul_(sub_(price, lastVlpDepositAmount),1e18),lastVlpDepositAmount); // 1e18 decimals
+                if(percentIncrease > 1e18){percentIncrease = 1e18;} // Cannot pull greater than 100%
                 lastVlpDepositAmount = price;
                 uint256 feeOut = div_(mul_(percentIncrease, performanceFee),10000);
                 unstakeVLPFresh(); // Unstake all VLP
