@@ -1530,7 +1530,9 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
              *  redeemAmount = redeemAmountIn
              */
             redeemTokens = div_(redeemAmountIn, exchangeRate);
-            redeemAmount = redeemAmountIn;
+            // redeemAmount = redeemAmountIn;
+            // Fix for division attack
+            redeemAmount = mul_ScalarTruncate(exchangeRate, redeemTokens);
         }
 
         /* Fail if redeem not allowed */
