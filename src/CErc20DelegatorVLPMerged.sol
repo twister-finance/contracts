@@ -466,7 +466,7 @@ contract CTokenStorage {
     uint public prevExchangeRate;
     uint public vlpBlockDelta;
     uint256 public autoCompoundBlockThreshold = 7000;
-    uint public lastVlpDepositAmount;
+    uint public lastVlpDepositAmount; // This is used to determine price increases
     uint public depositsDuringLastInterval;
 
 }

@@ -24,7 +24,7 @@ abstract contract PriceOracle {
 
 contract cTokenVLPPriceOracle is PriceOracle {
     uint256 internal constant VLP_PRICE_DECIMALS = 5;
-    address constant VELA_VLP_VAULT_ADDRESS = address(0x5957582F020301a2f732ad17a69aB2D8B2741241);
+    address constant VELA_VLP_VAULT_ADDRESS = address(0xC4ABADE3a15064F9E3596943c699032748b13352);
     
     // This oracle dervies its prices from Vela platform
     // All prices are either mantissa with 18 decimals or 0 if stale price. 0 reverts on main contract
