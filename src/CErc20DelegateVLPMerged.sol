@@ -437,9 +437,25 @@ contract CTokenStorage {
     uint public prevExchangeRate;
     uint public vlpBlockDelta;
     uint256 public autoCompoundBlockThreshold = 7000;
-    uint public lastVlpDepositAmount; // Represents the price at the last deposit
-    uint public depositsDuringLastInterval;
+    uint public lastVlpDepositPrice; // This is used to determine price increases
 
+    // Unique to VLP staking
+    
+    // Info of each user.
+    struct UserInfo {
+        uint256 lastUserMintTime; // The time the user made the last deposit
+        uint256 userRewardPerTokenPaid;
+        uint256 rewards;
+    }
+
+    uint256 public stakePeriodFinish;
+    uint256 public stakeRewardRate;
+    uint256 public stakeRewardsDuration = 5 minutes;
+    uint256 public stakeLastUpdateTime;
+    uint256 public stakeRewardPerTokenStored;
+
+    mapping(address => UserInfo) public userInfo;
+    
 }
 
 abstract contract CTokenInterface is CTokenStorage {
@@ -891,9 +907,21 @@ contract ExponentialNoError {
 pragma solidity 0.8.10;
 
 interface IVLPTokenFarm {
-    function deposit(uint256 _pid, uint256 _amount) external; // Deposit with 0 amount just yield reward
-    function withdraw(uint256 _pid, uint256 _amount) external; // Withdraw with 0 amount just yields reward
-    function userInfo(uint256 _pid, address _user) external view returns (uint256, uint256);
+    function depositVlp(uint256 _amount) external;
+    function withdrawVlp(uint256 _amount) external;
+    function depositEsvela(uint256 _amount) external;
+    function withdrawEsvela(uint256 _amount) external;
+    function harvestMany(bool _vela, bool _esVela, bool _vlp, bool _vesting) external;
+    function velaUserInfo(address _user) external view returns (uint256 _amount, uint256 _esAmount, uint256 _startTime);
+    function vlpUserInfo(address _user) external view returns (uint256 _amount, uint256 _startTime);
+}
+
+interface GlobalPriceOracle {
+    function getUnderlyingPrice(address cToken) external view returns (uint256);
+}
+
+interface VLPSettingsManager{
+    function cooldownDuration() external view returns (uint256);
 }
 
 interface IVLP {
@@ -909,10 +937,8 @@ interface IVLP {
     function balanceOf(address _account) external view returns (uint256);
 
     function totalSupply() external view returns (uint256);
-}
 
-interface VLPVault {
-    function getVLPPrice() external view returns (uint256);
+    function settingsManager() external view returns (address);
 }
 
 pragma solidity ^0.8.10;
@@ -923,6 +949,8 @@ pragma solidity ^0.8.10;
  * @author Compound
  */
 abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorReporter {
+    address internal constant GLOBAL_PRICE_ORACLE = address(0x414700ce4e7a66F1FfFFc196F5166937b9d1eB96);
+
     /**
      * @notice Initialize the money market
      * @param comptroller_ The address of the Comptroller
@@ -989,6 +1017,12 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
             revert TransferNotAllowed();
         }
 
+        // Check the cooldown duration
+        uint256 cooldown = VLPSettingsManager(vlpToken.settingsManager()).cooldownDuration();
+        if(block.timestamp - userInfo[src].lastUserMintTime < cooldown){
+            revert TransferNotAllowed();
+        }
+
         /* Get the allowance, infinite for the account owner */
         uint startingAllowance = 0;
         if (spender == src) {
@@ -997,10 +1031,16 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
             startingAllowance = transferAllowances[src][spender];
         }
 
+        // When transferring tokens, handle reward allocations
+        virtualUnstakeTwstVLPPerUser(src, tokens);
+        virtualStakeTwstVLPPerUser(dst, tokens);
+
         /* Do the calculations, checking for {under,over}flow */
         uint allowanceNew = startingAllowance - tokens;
         uint srcTokensNew = accountTokens[src] - tokens;
         uint dstTokensNew = accountTokens[dst] + tokens;
+
+        claimESVelaPerUser(src); // Auto claim to user after balances change
 
         /////////////////////////
         // EFFECTS & INTERACTIONS
@@ -1238,10 +1278,6 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
         compoundFresh();
     }
 
-    // Constant values with no storage slot needed
-    uint256 constant VLP_TOKEN_FARM_POOL_ID = 0;
-    uint256 constant ESVELA_TOKEN_FARM_POOL_ID = 2;
-
     /**
      * @notice Compound rewards earned  
      */
@@ -1267,15 +1303,19 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
         prevExchangeRate = exchangeRateStoredInternal();
 
         // Redeem all rewards from the token farm
-        vlpTokenFarm.deposit(VLP_TOKEN_FARM_POOL_ID, 0);
-        vlpTokenFarm.deposit(ESVELA_TOKEN_FARM_POOL_ID, 0);
+        uint256 _balance = EIP20Interface(esVelaToken).balanceOf(address(this));
+        vlpTokenFarm.harvestMany(true, true, true, true); // Will pull VELA and ESVELA, maybe USDC
+        uint256 _newBalance = EIP20Interface(esVelaToken).balanceOf(address(this));
+        if(_newBalance > _balance){
+            // We've earned some new ESVELA, add to reward contract
+            addStakeRewardAmount(sub_(_newBalance, _balance));
+        }
 
         // This will take all free esVELA and stake it to earn esVELA and USDC (via airdrop)
-        uint256 _balance = EIP20Interface(esVelaToken).balanceOf(address(this));
-        if(_balance > 0){
+        if(_newBalance > 0){
             EIP20Interface(esVelaToken).approve(address(vlpTokenFarm), 0);
             EIP20Interface(esVelaToken).approve(address(vlpTokenFarm), _balance);
-            vlpTokenFarm.deposit(ESVELA_TOKEN_FARM_POOL_ID, _balance);
+            vlpTokenFarm.depositEsvela(_balance);
         }
 
         // This will take all the free VLP and stake it to earn esVELA
@@ -1284,13 +1324,123 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
         accrualBlockNumber = currentBlockNumber;
     }
 
+    // Stake/Reward functions for obtaining esVELA
+
+    function stakeLastTimeRewardApplicable() public view returns (uint256) {
+        return min(block.timestamp, stakePeriodFinish);
+    }
+
+    function stakeRewardPerToken() public view returns (uint256) {
+        if (totalSupply == 0) {
+            return stakeRewardPerTokenStored;
+        }
+        uint256 result = add_(div_(mul_(mul_(sub_(stakeLastTimeRewardApplicable(), stakeLastUpdateTime), stakeRewardRate), 1e18), totalSupply), stakeRewardPerTokenStored);
+        return result;
+    }
+
+    function stakeRewardEarned(address account) public view returns (uint256) {
+        uint256 result = add_(div_(mul_(sub_(stakeRewardPerToken(), userInfo[account].userRewardPerTokenPaid), accountTokens[account]), 1e18), userInfo[account].rewards);
+        return result;
+    }
+
+    function min(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a < b ? a : b;
+    }
+
+    function updateStakeReward(address account) internal {
+        stakeRewardPerTokenStored = stakeRewardPerToken();
+        stakeLastUpdateTime = stakeLastTimeRewardApplicable();
+        if (account != address(0)) {
+            userInfo[account].rewards = stakeRewardEarned(account);
+            userInfo[account].userRewardPerTokenPaid = stakeRewardPerTokenStored;
+        }
+    }
+
+    function addStakeRewardAmount(uint256 reward) internal
+    {
+        updateStakeReward(address(0));
+
+        if (block.timestamp >= stakePeriodFinish) {
+            stakeRewardRate = div_(reward, stakeRewardsDuration);
+        } else {
+            // It restarts the reward duration allocation
+            uint256 remaining = sub_(stakePeriodFinish, block.timestamp);
+            uint256 leftover = mul_(remaining, stakeRewardRate);
+            stakeRewardRate = div_(add_(reward, leftover), stakeRewardsDuration);
+        }
+
+        // Ensure the provided reward amount is not more than the balance in the contract.
+        // This keeps the reward rate in the right range, preventing overflows due to
+        // very high values of rewardRate in the earned and rewardsPerToken functions;
+        // Reward + leftover must be less than 2^256 / 10^18 to avoid overflow.
+        uint256 balance = EIP20Interface(esVelaToken).balanceOf(address(this));
+        require(
+            stakeRewardRate <= div_(balance, stakeRewardsDuration),
+            "Provided reward too high"
+        );
+
+        stakeLastUpdateTime = block.timestamp;
+        stakePeriodFinish = add_(block.timestamp, stakeRewardsDuration);
+    }
+
+    /**
+     * @notice Virtually stake twstVLP per user
+     */
+    function virtualStakeTwstVLPPerUser(address _user, uint256 _amount) internal {
+        _amount;
+        updateStakeReward(_user);
+    }
+
+    /**
+     * @notice Virtually unstake twstVLP per user
+     */
+    function virtualUnstakeTwstVLPPerUser(address _user, uint256 _amount) internal {
+        _amount;
+        updateStakeReward(_user);
+    }
+
+    /**
+     * @notice Claim esVELA per user
+     */
+    function claimESVelaPerUser(address _user) internal {
+        updateStakeReward(_user);
+        uint256 reward = userInfo[_user].rewards;
+        if (reward > 0) {
+            // Remove all ESVela from the farm
+            (,uint256 totalEsvela,) = vlpTokenFarm.velaUserInfo(address(this));
+            vlpTokenFarm.withdrawEsvela(totalEsvela);
+
+            userInfo[_user].rewards = 0;
+            totalEsvela = EIP20Interface(esVelaToken).balanceOf(address(this));
+            if(totalEsvela < reward){
+                reward = totalEsvela; // Prevents contract from locking up
+            }
+            EIP20Interface(esVelaToken).transfer(_user, reward);
+
+            // Now redeposit esVELA
+            totalEsvela = EIP20Interface(esVelaToken).balanceOf(address(this));
+            if(totalEsvela > 0){
+                EIP20Interface(esVelaToken).approve(address(vlpTokenFarm), 0);
+                EIP20Interface(esVelaToken).approve(address(vlpTokenFarm), totalEsvela);
+                vlpTokenFarm.depositEsvela(totalEsvela);
+            }
+        }
+    }
+
     /**
      * @notice Unstaking VLP
      */
     function unstakeVLPFresh() internal {
-        (uint256 _bal, ) = vlpTokenFarm.userInfo(VLP_TOKEN_FARM_POOL_ID, address(this));
+        (uint256 _bal, ) = vlpTokenFarm.vlpUserInfo(address(this));
         if(_bal > 0){
-            vlpTokenFarm.withdraw(VLP_TOKEN_FARM_POOL_ID, _bal);
+            // Redeem all rewards from the token farm
+            uint256 _esBalance = EIP20Interface(esVelaToken).balanceOf(address(this));
+            vlpTokenFarm.withdrawVlp(_bal);
+            uint256 _newEsBalance = EIP20Interface(esVelaToken).balanceOf(address(this));
+            if(_newEsBalance > _esBalance){
+                // We've earned some new ESVELA, add to reward contract
+                addStakeRewardAmount(sub_(_newEsBalance, _esBalance));
+            }
         }
     }
 
@@ -1302,7 +1452,14 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
         if(_balance > 0){
             vlpToken.approve(address(vlpTokenFarm), 0);
             vlpToken.approve(address(vlpTokenFarm), _balance);
-            vlpTokenFarm.deposit(VLP_TOKEN_FARM_POOL_ID, _balance);
+            // Redeem all rewards from the token farm
+            uint256 _esBalance = EIP20Interface(esVelaToken).balanceOf(address(this));
+            vlpTokenFarm.depositVlp(_balance);
+            uint256 _newEsBalance = EIP20Interface(esVelaToken).balanceOf(address(this));
+            if(_newEsBalance > _esBalance){
+                // We've earned some new ESVELA, add to reward contract
+                addStakeRewardAmount(sub_(_newEsBalance, _esBalance));
+            }
         }
     }
 
@@ -1311,27 +1468,25 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
      * @dev This calculates interest accrued from the last checkpointed block
      *   up to the current block and writes new checkpoint to storage.
      */
-
-    uint256 internal constant VLP_PRICE_DECIMALS = 5;
     
     function accrueInterest() virtual override public returns (uint) {
         /* Determine the amount of VLP gain in price we will need to pull from contract to account for performance fee */
         if (isVLP){
-            uint256 price = VLPVault(vlpVault).getVLPPrice() * 1e18 / (10**VLP_PRICE_DECIMALS);
-            if(lastVlpDepositAmount == 0 || performanceFee == 0){
+            uint256 price = GlobalPriceOracle(GLOBAL_PRICE_ORACLE).getUnderlyingPrice(address(this));
+            if(lastVlpDepositPrice == 0 || performanceFee == 0){
                 // This is the initial accrual, do not pull anything out
-                lastVlpDepositAmount = price;
+                lastVlpDepositPrice = price;
                 return NO_ERROR;
             }
-            if(price < lastVlpDepositAmount){
+            if(price < lastVlpDepositPrice){
                 // This shouldn't happen normally, don't pull anything out
                 return NO_ERROR;
             }
-            if(price > lastVlpDepositAmount){
+            if(price > lastVlpDepositPrice){
                 // Price has increased, determine the percent increase, multiply it by performance fee and subtract that percentage and remove to admin
-                uint256 percentIncrease = div_(mul_(sub_(price, lastVlpDepositAmount),1e18),lastVlpDepositAmount); // 1e18 decimals
+                uint256 percentIncrease = div_(mul_(sub_(price, lastVlpDepositPrice),1e18),lastVlpDepositPrice); // 1e18 decimals
                 if(percentIncrease > 1e18){percentIncrease = 1e18;} // Cannot pull greater than 100%
-                lastVlpDepositAmount = price;
+                lastVlpDepositPrice = price;
                 uint256 feeOut = div_(mul_(percentIncrease, performanceFee),10000);
                 unstakeVLPFresh(); // Unstake all VLP
                 uint256 total_ = vlpToken.balanceOf(address(this));
@@ -1449,6 +1604,9 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
 
         uint mintTokens = div_(actualMintAmount, exchangeRate);
 
+        // Before adding mintTokens to user balance, update its stake position for esVELA rewards
+        virtualStakeTwstVLPPerUser(minter, mintTokens);
+
         /*
          * We calculate the new total supply of cTokens and minter token balance, checking for overflow:
          *  totalSupplyNew = totalSupply + mintTokens
@@ -1469,6 +1627,8 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
             compoundFresh();
             stakeVLPFresh();
         }
+
+        userInfo[minter].lastUserMintTime = block.timestamp;
 
     }
 
@@ -1524,6 +1684,11 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
             unstakeVLPFresh(); // Unstake all VLP for all redeems
         }
 
+        uint256 cooldown = VLPSettingsManager(vlpToken.settingsManager()).cooldownDuration();
+        if(block.timestamp - userInfo[redeemer].lastUserMintTime < cooldown){
+            revert TransferNotAllowed();
+        }
+
         /* exchangeRate = invoke Exchange Rate Stored() */
         Exp memory exchangeRate = Exp({mantissa: exchangeRateStoredInternal() });
 
@@ -1566,6 +1731,9 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
             revert RedeemTransferOutNotPossible();
         }
 
+        // Before removing mintTokens from user balance, update its stake position for esVELA rewards
+        virtualUnstakeTwstVLPPerUser(redeemer, redeemTokens);
+
         /////////////////////////
         // EFFECTS & INTERACTIONS
         // (No safe failures beyond this point)
@@ -1577,6 +1745,8 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
          */
         totalSupply = totalSupply - redeemTokens;
         accountTokens[redeemer] = accountTokens[redeemer] - redeemTokens;
+
+        claimESVelaPerUser(redeemer); // Auto claim to user after balance change
 
         /*
          * We invoke doTransferOut for the redeemer and the redeemAmount.
@@ -1891,6 +2061,10 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
         uint protocolSeizeAmount = mul_ScalarTruncate(exchangeRate, protocolSeizeTokens);
         uint totalReservesNew = totalReserves + protocolSeizeAmount;
 
+        // When transferring tokens, handle reward allocations
+        virtualUnstakeTwstVLPPerUser(borrower, seizeTokens);
+        virtualStakeTwstVLPPerUser(liquidator, liquidatorSeizeTokens);
+
 
         /////////////////////////
         // EFFECTS & INTERACTIONS
@@ -1901,6 +2075,8 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
         totalSupply = totalSupply - protocolSeizeTokens;
         accountTokens[borrower] = accountTokens[borrower] - seizeTokens;
         accountTokens[liquidator] = accountTokens[liquidator] + liquidatorSeizeTokens;
+
+        claimESVelaPerUser(borrower); // Auto claim to user after balances change
 
         /* Emit a Transfer event */
         emit Transfer(borrower, liquidator, liquidatorSeizeTokens);
@@ -2656,7 +2832,7 @@ contract CErc20 is CToken, CErc20Interface {
         uint256 _extrabal = 0;
         if(isVLP){
             // Need to count the amount in the farm
-            (_extrabal, ) = vlpTokenFarm.userInfo(VLP_TOKEN_FARM_POOL_ID, address(this));
+            (_extrabal, ) = vlpTokenFarm.vlpUserInfo(address(this));
         }
         return add_(token.balanceOf(address(this)),_extrabal);
     }
@@ -2747,6 +2923,7 @@ contract CErc20 is CToken, CErc20Interface {
  * @author Compound
  */
 contract CErc20Delegate is CErc20, CDelegateInterface {
+
     /**
      * @notice Construct an empty delegate
      */

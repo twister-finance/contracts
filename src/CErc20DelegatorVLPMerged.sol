@@ -466,8 +466,24 @@ contract CTokenStorage {
     uint public prevExchangeRate;
     uint public vlpBlockDelta;
     uint256 public autoCompoundBlockThreshold = 7000;
-    uint public lastVlpDepositAmount; // This is used to determine price increases
-    uint public depositsDuringLastInterval;
+    uint public lastVlpDepositPrice; // This is used to determine price increases
+
+    // Unique to VLP staking
+    
+    // Info of each user.
+    struct UserInfo {
+        uint256 lastUserMintTime; // The time the user made the last deposit
+        uint256 userRewardPerTokenPaid;
+        uint256 rewards;
+    }
+
+    uint256 public stakePeriodFinish;
+    uint256 public stakeRewardRate;
+    uint256 public stakeRewardsDuration = 5 minutes;
+    uint256 public stakeLastUpdateTime;
+    uint256 public stakeRewardPerTokenStored;
+
+    mapping(address => UserInfo) public userInfo;
 
 }
 
