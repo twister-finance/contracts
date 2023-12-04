@@ -2108,6 +2108,7 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
     address constant HMX_USDC_REWARDER_1 = address(0x665099B3e59367f02E5f9e039C3450E31c338788);
     address constant HMX_ESHMX_REWARDER_1 = address(0xCE3C078282df113eFc3D816E83Ca70f4c19d9daB);
     address constant HMX_DRAGON_REWARDER_1 = address(0x6D2c18B559C5343CB0703bB55AADB5f22152cC32);
+    address constant HMX_ARB_REWARDER = address(0x238DAF7b15342113B00fA9e3F3E60a11Ab4274fD);
     address constant HMX_USDC_REWARDER_2 = address(0xB698829C4C187C85859AD2085B24f308fC1195D3);
     address constant HMX_ESHMX_REWARDER_2 = address(0x94c22459b145F012F1c6791F2D729F7a22c44764);
     address constant HMX_DRAGON_REWARDER_2 = address(0xbEDd351c62111FB7216683C2A26319743a06F273);
@@ -2155,19 +2156,20 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
         pools[1] = HMX_STAKING_POOL;
 
         address[][] memory rewarderPools = new address[][](2);
-        address[] memory innerRewarder = new address[](3);
+        address[] memory innerRewarder = new address[](4);
         innerRewarder[0] = HMX_USDC_REWARDER_1;
         innerRewarder[1] = HMX_ESHMX_REWARDER_1;
         innerRewarder[2] = HMX_DRAGON_REWARDER_1;
-        rewarderPools[0] = innerRewarder;
+        innerRewarder[3] = HMX_ARB_REWARDER;
+        rewarderPools[0] = innerRewarder; // For HLP
         innerRewarder = new address[](3);
         innerRewarder[0] = HMX_USDC_REWARDER_2;
         innerRewarder[1] = HMX_ESHMX_REWARDER_2;
         innerRewarder[2] = HMX_DRAGON_REWARDER_2;
-        rewarderPools[1] = innerRewarder;
+        rewarderPools[1] = innerRewarder; // For esHMX
 
         IHLPTokenRewarder rewarder = IHLPTokenRewarder(HMX_TOKEN_REWARDER_DISTRIBUTOR);
-        rewarder.compound(pools, rewarderPools, 0, 0, new uint256[](0)); // Redeem USDC and autocompound ESHMX and Dragon points
+        rewarder.compound(pools, rewarderPools, 0, 0, new uint256[](0)); // Redeem USDC, ARB and autocompound ESHMX and Dragon points
 
         // USDC is swept by deployer to manually compound
 
