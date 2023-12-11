@@ -2309,6 +2309,11 @@ contract CErc20 is CToken, CErc20Interface {
     function isGLP() external view returns (bool) {
         return nonBorrowable; // Used to maintain compatibility
     }
+
+    // Specific for the UI
+    function autocompound() external pure returns (bool) {
+        return true;
+    }
     
     /*** User Interface ***/
 
