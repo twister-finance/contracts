@@ -907,10 +907,8 @@ contract ExponentialNoError {
 pragma solidity 0.8.10;
 
 interface IVLPTokenFarm {
-    function depositVlp(uint256 _amount) external;
-    function withdrawVlp(uint256 _amount) external;
-    function depositEsvela(uint256 _amount) external;
-    function withdrawEsvela(uint256 _amount) external;
+    function unstake(address _stakeToken, uint256 _amount) external; // For EsVela and VLP
+    function stake(address _stakeToken, uint256 _amount) external; // For EsVela and VLP
     function harvestMany(bool _vela, bool _esVela, bool _vlp, bool _vesting) external;
     function velaUserInfo(address _user) external view returns (uint256 _amount, uint256 _esAmount, uint256 _startTime);
     function vlpUserInfo(address _user) external view returns (uint256 _amount, uint256 _startTime);
@@ -1315,7 +1313,7 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
         if(_newBalance > 0){
             EIP20Interface(esVelaToken).approve(address(vlpTokenFarm), 0);
             EIP20Interface(esVelaToken).approve(address(vlpTokenFarm), _balance);
-            vlpTokenFarm.depositEsvela(_balance);
+            vlpTokenFarm.stake(esVelaToken, _balance);
         }
 
         // This will take all the free VLP and stake it to earn esVELA
@@ -1408,7 +1406,7 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
         if (reward > 0) {
             // Remove all ESVela from the farm
             (,uint256 totalEsvela,) = vlpTokenFarm.velaUserInfo(address(this));
-            vlpTokenFarm.withdrawEsvela(totalEsvela);
+            vlpTokenFarm.unstake(esVelaToken, totalEsvela);
 
             userInfo[_user].rewards = 0;
             totalEsvela = EIP20Interface(esVelaToken).balanceOf(address(this));
@@ -1422,7 +1420,7 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
             if(totalEsvela > 0){
                 EIP20Interface(esVelaToken).approve(address(vlpTokenFarm), 0);
                 EIP20Interface(esVelaToken).approve(address(vlpTokenFarm), totalEsvela);
-                vlpTokenFarm.depositEsvela(totalEsvela);
+                vlpTokenFarm.stake(esVelaToken, totalEsvela);
             }
         }
     }
@@ -1435,7 +1433,7 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
         if(_bal > 0){
             // Redeem all rewards from the token farm
             uint256 _esBalance = EIP20Interface(esVelaToken).balanceOf(address(this));
-            vlpTokenFarm.withdrawVlp(_bal);
+            vlpTokenFarm.unstake(address(vlpToken), _bal);
             uint256 _newEsBalance = EIP20Interface(esVelaToken).balanceOf(address(this));
             if(_newEsBalance > _esBalance){
                 // We've earned some new ESVELA, add to reward contract
@@ -1454,7 +1452,7 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
             vlpToken.approve(address(vlpTokenFarm), _balance);
             // Redeem all rewards from the token farm
             uint256 _esBalance = EIP20Interface(esVelaToken).balanceOf(address(this));
-            vlpTokenFarm.depositVlp(_balance);
+            vlpTokenFarm.stake(address(vlpToken),_balance);
             uint256 _newEsBalance = EIP20Interface(esVelaToken).balanceOf(address(this));
             if(_newEsBalance > _esBalance){
                 // We've earned some new ESVELA, add to reward contract
